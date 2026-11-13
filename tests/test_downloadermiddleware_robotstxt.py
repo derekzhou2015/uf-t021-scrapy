@@ -359,6 +359,90 @@ Disallow: /some/randome/page.html
         assert robotsreq.meta["download_handler"] == "named"
         assert robotsreq.meta["is_robotstxt_request"] is True
 
+    def _get_mixed_scheme_crawler(self) -> mock.MagicMock:
+        """The same host serves different robots.txt files over HTTP and
+        HTTPS, as allowed by RFC 9309."""
+        crawler = self.crawler
+        crawler.settings.set("ROBOTSTXT_OBEY", True)
+        robots_bodies = {
+            "http://site.local/robots.txt": (
+                b"User-Agent: *\nDisallow: /https-only\nAllow: /http-only\n"
+            ),
+            "https://site.local/robots.txt": (
+                b"User-Agent: *\nDisallow: /http-only\nAllow: /https-only\n"
+            ),
+        }
+
+        async def return_response(request: Request) -> Response:
+            return TextResponse(request.url, body=robots_bodies[request.url])
+
+        crawler.engine.download_async.side_effect = return_response
+        return crawler
+
+    async def _assert_mixed_scheme_verdict(
+        self, middleware: RobotsTxtMiddleware
+    ) -> None:
+        # Each scheme is judged by its own robots.txt, regardless of the
+        # order in which the schemes were first requested.
+        await self.assertNotIgnored(Request("http://site.local/http-only"), middleware)
+        await self.assertIgnored(Request("http://site.local/https-only"), middleware)
+        await self.assertIgnored(Request("https://site.local/http-only"), middleware)
+        await self.assertNotIgnored(
+            Request("https://site.local/https-only"), middleware
+        )
+
+    @coroutine_test
+    async def test_robotstxt_scheme_isolation_http_first(self) -> None:
+        middleware = build_from_crawler(
+            RobotsTxtMiddleware, self._get_mixed_scheme_crawler()
+        )
+        await self.assertNotIgnored(Request("http://site.local/http-only"), middleware)
+        await self._assert_mixed_scheme_verdict(middleware)
+        assert set(middleware._parsers) == {
+            ("http", "site.local"),
+            ("https", "site.local"),
+        }
+        downloaded = [
+            call.args[0].url
+            for call in self.crawler.engine.download_async.call_args_list
+        ]
+        assert downloaded == [
+            "http://site.local/robots.txt",
+            "https://site.local/robots.txt",
+        ]
+
+    @coroutine_test
+    async def test_robotstxt_scheme_isolation_https_first(self) -> None:
+        middleware = build_from_crawler(
+            RobotsTxtMiddleware, self._get_mixed_scheme_crawler()
+        )
+        await self.assertNotIgnored(
+            Request("https://site.local/https-only"), middleware
+        )
+        await self._assert_mixed_scheme_verdict(middleware)
+        downloaded = [
+            call.args[0].url
+            for call in self.crawler.engine.download_async.call_args_list
+        ]
+        assert downloaded == [
+            "https://site.local/robots.txt",
+            "http://site.local/robots.txt",
+        ]
+
+    @coroutine_test
+    async def test_robotstxt_scheme_isolation_interleaved(self) -> None:
+        """Concurrent requests to both schemes must not share a parser."""
+        middleware = build_from_crawler(
+            RobotsTxtMiddleware, self._get_mixed_scheme_crawler()
+        )
+        await asyncio.gather(
+            self.assertNotIgnored(Request("http://site.local/http-only"), middleware),
+            self.assertNotIgnored(Request("https://site.local/https-only"), middleware),
+            self.assertIgnored(Request("http://site.local/https-only"), middleware),
+            self.assertIgnored(Request("https://site.local/http-only"), middleware),
+        )
+        assert self.crawler.engine.download_async.call_count == 2
+
     async def assertNotIgnored(
         self, request: Request, middleware: RobotsTxtMiddleware
     ) -> None:
